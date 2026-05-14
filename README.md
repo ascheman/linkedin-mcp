@@ -18,13 +18,34 @@ To correct a post, delete and re-post.
 
 ### Mentions
 
-LinkedIn's REST Posts API does **not** support @mentions of organizations
-or people via the API. Neither top-level `annotations` nor inline
-`@[Name](urn)` markup work with the versioned `/rest/posts` endpoint.
+`create_post` supports `@mentions` via the optional `mentions` parameter.
+Pass a JSON list of `{text, urn}` pairs — each entry's `text` must
+appear verbatim (case-sensitive) in the post body, and the first
+occurrence is wrapped as a LinkedIn `CompanyAttributedEntity`
+(or `MemberAttributedEntity` if the URN is `urn:li:person:...`).
 
-To add @mentions, edit the post manually in the LinkedIn web UI after
-creating it via the API. LinkedIn's editor will suggest organizations
-and people as you type `@`.
+```python
+create_post(
+    text="Thanks to The Apache Software Foundation for the Maven project.",
+    mentions='[{"text": "The Apache Software Foundation", "urn": "urn:li:organization:215982"}]',
+)
+```
+
+Entity URNs are typically `urn:li:organization:NNN` for companies or
+`urn:li:person:XYZ` for people. To find an organization's URN, open its
+LinkedIn page and look for `facetCurrentCompany=NNNNNN` in any embedded
+employee-directory link — that number is the org ID.
+
+#### Why we use the legacy `/v2/ugcPosts` endpoint
+
+Posts go through LinkedIn's legacy `/v2/ugcPosts` API (with the
+matching `/v2/assets` image-upload flow) rather than the newer
+`/rest/posts` endpoint. The newer API documents inline
+`@[Name](urn)` mention markup, but only parses it for
+organization-authored posts; member-authored posts pass the markup
+through as literal text. The legacy endpoint's explicit
+`shareCommentary.attributes` array works for member-authored posts,
+which is what this MCP serves.
 
 ## Setup
 

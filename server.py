@@ -82,45 +82,113 @@ def create_post(
     text: str,
     image_path: str = "",
     image_alt: str = "",
+    mentions: str = "",
 ) -> str:
     """Create a new LinkedIn post (text + optional image, max 3000 chars).
+
+    Uses the legacy /v2/ugcPosts endpoint because the modern /rest/posts
+    endpoint does not parse inline mention markup for member-authored
+    posts (only for organization-authored posts).
 
     Args:
         text: The post text (max 3000 chars).
         image_path: Optional absolute path to an image file to attach.
         image_alt: Alt text for the image (accessibility).
+        mentions: Optional JSON list of mentions to embed in the post
+            text, e.g.
+              '[{"text": "The Apache Software Foundation",
+                 "urn": "urn:li:organization:215982"}]'
+            Each entry's `text` must already appear verbatim in the
+            post body (case-sensitive). The first occurrence is wrapped
+            as a LinkedIn `CompanyAttributedEntity` annotation, so it
+            renders as a styled link in the feed. Entity URNs are
+            typically `urn:li:organization:NNN` for companies or
+            `urn:li:person:XYZ` for people.
     """
     try:
         author = _get_person_urn()
 
-        # Handle image upload if provided
-        image_urn = None
-        if image_path.strip():
-            image_urn = _upload_image(image_path, author)
+        # Build the attributes array from `mentions` JSON.
+        attributes = []
+        if mentions.strip():
+            try:
+                mention_list = json.loads(mentions)
+            except json.JSONDecodeError as e:
+                return json.dumps({
+                    "error": f"mentions parameter is not valid JSON: {e}",
+                    "got": mentions,
+                })
+            if not isinstance(mention_list, list):
+                return json.dumps({
+                    "error": "mentions parameter must be a JSON list",
+                    "got": mentions,
+                })
+            for m in mention_list:
+                if not isinstance(m, dict):
+                    continue
+                mtext = m.get("text", "")
+                murn = m.get("urn", "")
+                if not mtext or not murn:
+                    continue
+                idx = text.find(mtext)
+                if idx < 0:
+                    return json.dumps({
+                        "error": (
+                            f"mention text {mtext!r} not found in post body"
+                        ),
+                    })
+                # Pick the wrapping value based on the URN type.
+                if ":person:" in murn:
+                    value = {
+                        "com.linkedin.common.MemberAttributedEntity": {
+                            "member": murn,
+                        },
+                    }
+                else:
+                    value = {
+                        "com.linkedin.common.CompanyAttributedEntity": {
+                            "company": murn,
+                        },
+                    }
+                attributes.append({
+                    "length": len(mtext),
+                    "start": idx,
+                    "value": value,
+                })
 
-        # Build post body
+        # Optional image upload — uses the legacy /v2/assets API to fit
+        # the ugcPosts schema (assets/uploadUrl + DigitalMediaAsset URN).
+        asset_urn = None
+        if image_path.strip():
+            asset_urn = _upload_image_legacy(image_path, author)
+
+        share_content = {
+            "shareCommentary": {
+                "text": text,
+                "attributes": attributes,
+            },
+            "shareMediaCategory": "IMAGE" if asset_urn else "NONE",
+        }
+        if asset_urn:
+            share_content["media"] = [{
+                "status": "READY",
+                "media": asset_urn,
+                "title": {"text": image_alt or "Image"},
+                "description": {"text": image_alt or ""},
+            }]
+
         post_body = {
             "author": author,
             "lifecycleState": "PUBLISHED",
-            "visibility": "PUBLIC",
-            "commentary": text,
-            "distribution": {
-                "feedDistribution": "MAIN_FEED",
-                "targetEntities": [],
-                "thirdPartyDistributionChannels": [],
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": share_content,
+            },
+            "visibility": {
+                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC",
             },
         }
 
-        if image_urn:
-            post_body["content"] = {
-                "media": {
-                    "title": image_alt or "Image",
-                    "id": image_urn,
-                    "altText": image_alt or "",
-                }
-            }
-
-        resp = _client.post("/rest/posts", json=post_body)
+        resp = _client.post("/v2/ugcPosts", json=post_body)
         if resp.status_code >= 400:
             return json.dumps({
                 "error": f"{resp.status_code} {resp.reason_phrase}",
@@ -128,9 +196,8 @@ def create_post(
                 "request_body": post_body,
             }, indent=2)
 
-        # LinkedIn returns the post URN in the x-restli-id header
+        # /v2/ugcPosts returns the URN in the x-restli-id header.
         post_urn = resp.headers.get("x-restli-id", "")
-
         return json.dumps({
             "urn": post_urn,
             "url": f"https://www.linkedin.com/feed/update/{post_urn}/",
@@ -140,30 +207,35 @@ def create_post(
         return json.dumps({"error": str(e)})
 
 
-def _upload_image(file_path: str, author: str) -> str:
-    """Upload an image to LinkedIn and return its media URN.
+def _upload_image_legacy(file_path: str, author: str) -> str:
+    """Upload an image via /v2/assets and return its DigitalMediaAsset URN.
 
-    LinkedIn image upload is a two-step process:
-    1. Register the upload (get an upload URL + image URN)
-    2. Upload the binary to that URL
+    Legacy two-step flow used by /v2/ugcPosts:
+    1. POST /v2/assets?action=registerUpload to get an uploadUrl + asset URN
+    2. PUT the binary to the uploadUrl
     """
-    # Step 1: Register upload
     register_body = {
-        "initializeUploadRequest": {
+        "registerUploadRequest": {
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
             "owner": author,
+            "serviceRelationships": [{
+                "relationshipType": "OWNER",
+                "identifier": "urn:li:userGeneratedContent",
+            }],
         }
     }
-    resp = _client.post("/rest/images?action=initializeUpload", json=register_body)
+    resp = _client.post("/v2/assets?action=registerUpload", json=register_body)
     resp.raise_for_status()
-    upload_data = resp.json()["value"]
-    upload_url = upload_data["uploadUrl"]
-    image_urn = upload_data["image"]
+    value = resp.json()["value"]
+    upload_url = value["uploadMechanism"][
+        "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
+    ]["uploadUrl"]
+    asset_urn = value["asset"]
 
-    # Step 2: Upload binary
     with open(file_path, "rb") as f:
         img_data = f.read()
 
-    upload_resp = httpx.put(
+    upload_resp = httpx.post(
         upload_url,
         content=img_data,
         headers={
@@ -174,7 +246,7 @@ def _upload_image(file_path: str, author: str) -> str:
     )
     upload_resp.raise_for_status()
 
-    return image_urn
+    return asset_urn
 
 
 @mcp.tool()
