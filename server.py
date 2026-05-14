@@ -30,7 +30,7 @@ if not _access_token:
 _API_BASE = "https://api.linkedin.com"
 _HEADERS = {
     "Authorization": f"Bearer {_access_token}",
-    "LinkedIn-Version": "202504",
+    "LinkedIn-Version": "202604",
     "X-Restli-Protocol-Version": "2.0.0",
     "Content-Type": "application/json",
 }
